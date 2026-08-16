@@ -13,17 +13,15 @@ const OLLAMA_MODEL_NAME = 'qwen-64k'; //（FROM qwen2.5:32b PARAMETER num_ctx 65
 // --- Claude API 設定 ---
 const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages';
 const CLAUDE_MODEL_NAME = 'claude-3-5-sonnet-20241022';
-const CLAUDE_API_KEY = 'SECRET';
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || CLAUDE_API_KEY;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 // 共通設定
 const INPUT_DIR_NAME = 'kakuyomu_episodes';
 const MAX_CHARS_PER_REQUEST = 15000;
-const LOG_SUMMARY_THRESHOLD = 12000;
 const MAX_TOTAL_CHARS = 500000;
 
 const CHUNK_SIZE = 1;
-const NUM_CTX = 16384; //MAX_CHARS_PER_REQUEST(15,000字)をカバーできるサイズに設定（最大65536、約40,000 〜 45,000文字まで拡張可）
+const NUM_CTX = 16384; 
 // =================================================================
 
 function truncateText(text, maxChars, label = '', keepEnd = true) {
@@ -43,68 +41,64 @@ function truncateText(text, maxChars, label = '', keepEnd = true) {
  * LLMの出力から「■ 最新の世界観・組織の力学メモ」の部分を切り出す関数
  */
 function extractMemory(responseText, previousMemory) {
-    const memoryMatch = responseText.match(/■\s*最新の世界観・組織の力学メモ[\s\S]*?(?=\n■|\n$|$)/);
-    
+    const memoryMatch = responseText.match(/(?:#+\s*|■\s*)?最新の世界観・組織の力学メモ[\s\S]*?(?=\n(?:#+\s*|■)|$)/i);
+
     if (memoryMatch && memoryMatch[0].trim()) {
         return memoryMatch[0].trim();
     }
-    
+
     console.warn('メモセクションの抽出に失敗したため、前回の文脈メモを維持します。');
-    return previousMemory || '■ 最新の世界観・組織の力学メモ（箇条書きで最大3つ）：\n・未評価（分析進行中）';
+    return previousMemory || '■ 最新の世界観・組織の力学メモ：\n・未評価（分析進行中）';
 }
 
 /**
  * LLMの出力から「作為的無能・描写の歪みの指摘」部分を抽出する関数
  */
 function extractIncompetence(responseText) {
-    const pattern = /(?:[・･■\-*]|\*\*)?\s*作為的無能[・･]?描写の歪みの指摘\s*[:：]?[\s\S]*?(?=\n\s*■|\n\s*・\s*構造的合理性|\n\s*#+|\n$|$)/i;
-    
+    const pattern = /(?:[・･■\-*]|\*\*|#+)?\s*作為的無能[・･]?描写の歪みの指摘\s*[:：]?[\s\S]*?(?=\n\s*(?:#+\s*|■)|(?:\n\s*・\s*構造的合理性)|$)/i;
+
     const match = responseText.match(pattern);
     if (match && match[0].trim()) {
         return match[0].trim();
     }
-    
+
     return '・作為的無能・描写の歪みの指摘： 抽出失敗（形式不一致）';
 }
 
-// ログテキストを文字数ごとに分割する関数
-function chunkText(text, chunkSize = LOG_SUMMARY_THRESHOLD) {
-    const chunks = [];
-    for (let i = 0; i < text.length; i += chunkSize) {
-        chunks.push(text.slice(i, i + chunkSize));
-    }
-    return chunks;
-}
-
 /**
- * 肥大化した全セッションログをブロック分割して中間要約する関数
+ * 指摘ログに実際に問題（作為的無能等）が含まれているかを厳密に判定する関数
  */
-async function summarizeAllLogs(fullLog) {
-    const logChunks = chunkText(fullLog, LOG_SUMMARY_THRESHOLD);
-    const intermediateSummaries = [];
+function isIssueDetected(incompetenceText) {
+    if (!incompetenceText) return false;
+    if (incompetenceText.includes('抽出失敗')) return false;
 
-    console.log(`\n▶ 累積ログ(${fullLog.length.toLocaleString()}文字)が大きいため、${logChunks.length}個のブロックに分けて中間要約します...`);
+    // ヘッダー部分を取り除いて本文のみを取り出す
+    const bodyText = incompetenceText.replace(/^(?:[・･■\-*]|\*\*|#+)?\s*作為的無能[・･]?描写の歪みの指摘\s*[:：]?/i, '').trim();
 
-    for (let i = 0; i < logChunks.length; i++) {
-        console.log(`  └ ブロック [${i + 1}/${logChunks.length}] を要約中...`);
-        const systemContent = "あなたは長編小説の監査ログを整理・統合する編集アシスタントです。";
-        const userContent = `以下の監査ログ（パート ${i + 1}/${logChunks.length}）から、キャラクター行動の矛盾・歪み・設定の評価ポイントを箇条書きで1,000字程度に要約してください。
+    // 指摘が「ない」ことを示すキーワード群
+    const noIssueKeywords = [
+        'なし', '特になし', '見受けられない', '見当たらない', '指摘なし', 
+        '問題なし', '整合性が保たれている', '不自然な点は見られない', '顕著な歪みはない'
+    ];
 
-【対象ログ】
-${logChunks[i]}`;
-
-        // callOllama ではなく共通の callLLM を使用
-        const summary = await callLLM({ systemContent, userContent, temperature: 0.0 });
-        intermediateSummaries.push(summary);
+    // 本文が非常に短く、かつ「なし」系キーワードに該当する場合は問題なしと判定
+    for (const keyword of noIssueKeywords) {
+        if (bodyText === keyword || bodyText.startsWith(keyword + '。') || bodyText.startsWith(keyword + '（') || bodyText.startsWith(keyword + '\n')) {
+            return false;
+        }
     }
 
-    const compressedLog = intermediateSummaries.join("\n\n--- 次のブロック ---\n\n");
-    return compressedLog;
+    // 「なし」などのキーワードのみで構成されているか判定
+    const cleaned = bodyText.replace(/[。、\n\s（）()]/g, '');
+    if (noIssueKeywords.some(k => cleaned === k)) {
+        return false;
+    }
+
+    return true;
 }
 
 /**
  * 【共通APIインターフェース】
- * USE_CLAUDE フラグによって Ollama と Claude API を切り替えて呼び出す関数
  */
 async function callLLM({ systemContent, userContent, temperature = 0.0 }) {
     const controller = new AbortController();
@@ -112,9 +106,8 @@ async function callLLM({ systemContent, userContent, temperature = 0.0 }) {
 
     try {
         if (USE_CLAUDE) {
-            // --- Claude API の呼び出し ---
-            if (!ANTHROPIC_API_KEY || ANTHROPIC_API_KEY === CLAUDE_API_KEY) {
-                throw new Error('Claude APIキーが設定されていません。環境変数 ANTHROPIC_API_KEY を設定するか、コード内で指定してください。');
+            if (!ANTHROPIC_API_KEY) {
+                throw new Error('Claude APIキーが設定されていません。環境変数 ANTHROPIC_API_KEY を設定してください。');
             }
 
             const response = await fetch(CLAUDE_API_URL, {
@@ -146,7 +139,6 @@ async function callLLM({ systemContent, userContent, temperature = 0.0 }) {
             return data.content[0].text.trim();
 
         } else {
-            // --- Ollama API の呼び出し ---
             const payload = {
                 model: OLLAMA_MODEL_NAME,
                 messages: [
@@ -183,13 +175,10 @@ async function callLLM({ systemContent, userContent, temperature = 0.0 }) {
     }
 }
 
-// 塊ごとに監査し、世界観・組織の記憶メモを更新していく関数
+// 塊ごとに監査する関数
 async function auditChunk(title, episodes, currentMemory, isPartialRead = false) {
     let episodeListStr = episodes.map(ep => `【${ep.name}】\n${ep.text}`).join('\n\n');
     episodeListStr = truncateText(episodeListStr, MAX_CHARS_PER_REQUEST, 'エピソード本文（チャンク）', false);
-
-    let systemContent = "";
-    let userContent = "";
 
     const coreOrganizationalPrinciples = `
 【組織力学・キャラクター描写評価における最重要原則】
@@ -204,14 +193,13 @@ async function auditChunk(title, episodes, currentMemory, isPartialRead = false)
    - 特定のイベント進行や主人公の活躍・引き立て、不都合な展開の回避のためだけに、キャラクターが「本来の立場や能力に見合わない不自然な失言・判断ミス・警戒感の急激な欠落」を起こしている場合、それを「組織の歪み」と言い換えて免罪化することを厳禁とする。個人の知性崩壊・作為的描写として明確に弾劾せよ。
 `;
 
-    if (isPartialRead) {
-        const partialReadInstruction = `\n※重要：今回の監査は作品全体の「部分読み」です。未登場の設定や後続の伏線がある可能性を考慮して文脈を保留しつつも、国家機能の機能不全やキャラクターの立ち回りに不自然な作為性（作劇上の強引な無能化）がないかを厳格に検証してください。`;
+    const partialReadInstruction = isPartialRead ? `\n※重要：今回の監査は作品全体の「部分読み」です。未登場の設定や後続の伏線がある可能性を考慮して文脈を保留しつつも、国家機能の機能不全やキャラクターの立ち回りに不自然な作為性（作劇上の強引な無能化）がないかを厳格に検証してください。` : '';
 
-        systemContent = `あなたは現代政治・軍事から前近代の専制政治、および人間心理と作劇論理の整合性を極限まで追求する冷徹な社会・描写アナリストです。
+    const systemContent = `あなたは現代政治・軍事から前近代の専制政治、および人間心理と作劇論理の整合性を極限まで追求する冷徹な社会・描写アナリストです。
 国家・組織の構造論理（マクロ）と危機管理対応の妥当性、および登場人物一人ひとりの行動・判断の納得感（ミクロ）の双方から妥協なく監査を行ってください。${partialReadInstruction}
 ${coreOrganizationalPrinciples}`;
 
-        userContent = `提示されたエピソード群における「国家・組織」および「個々の登場人物」の行動を監査し、その納得可能性と作為性を以下のプロセスで検証してください。
+    const userContent = `提示されたエピソード群における「国家・組織」および「個々の登場人物」の行動を監査し、その納得可能性と作為性を以下のプロセスで検証してください。
 
 【監査・判定のプロセス】
 1. 【マクロ構造と国家・組織機能の検証】
@@ -239,108 +227,65 @@ ${episodeListStr}
 ・構造的合理性（組織・人物の動機の納得感、または文脈の保留）： （※社会構造や人物の立場から逆算して論理的に納得できる政治劇・行動・機能不全のロジック、あるいは保留理由を記述）
 ・作為的無能・描写の歪みの指摘： （※「国家・組織レベルで当然行うべき広報・防衛・危機管理等の放置」や「個々のキャラがプロット都合で知性や警戒を失っている点」があれば冷酷に指摘。整合性が保たれていれば「なし」と記述）`;
 
-    } else {
-        systemContent = `あなたは現代政治・軍事から前近代の専制政治、および人間心理と作劇論理の整合性を極限まで追求する冷徹な社会・描写アナリストです。
-国家や組織の構造（マクロ）における初期対応の妥当性から、その中で動く個々のキャラクターの行動・判断の妥当性（ミクロ）まで厳しい眼光を光らせて監査を行ってください。
-${coreOrganizationalPrinciples}`;
-
-        userContent = `提示されたエピソード群における「国家・組織」および「個々の登場人物」の行動を監査し、その納得可能性と作為性を以下のプロセスで解剖してください。
-
-【監査・判定のプロセス】
-1. 【マクロ構造と国家・組織機能の検証】
-   - 舞台設定（現代型か前近代型か）に照らし、異常発生時の国家・組織の動きが妥当か、あるいは**国家防衛・広報戦略・危機管理などの初期対応がプロット進行のために不自然に麻痺・無能化されていないか**を評価します。
-
-2. 【ミクロ（個別キャラクター行動）の検証】★最重点項目
-   - 組織レベルでどのような大義名分や背景理由があろうとも、個々の登場人物の行動描写を免罪化してはなりません。
-   - 「プロットを特定の方向に動かすため」「特定人物を引き立てるため」だけに、キャラクターが本来持つべき知性、危機管理意識、立場上のプライド、あるいは合理的判断を放棄していないかを厳しく検証してください。
-
-3. 【作為的無能の弾劾】
-   - 「国家・行政レベルの不自然な不作為」および「キャラの都合よい無能化・雑な失言・唐突な判断ミス」など、作劇上の作為的な歪みを明確に弾劾してください。
-
-【これまでの世界観・組織設定メモ】
-${currentMemory ? currentMemory : '（最初のセッションのため未構築）'}
-
-【今回追加される対象本文】
-${episodeListStr}
-
-【出力フォーマット】
-余計な前置きは完全に排除し、以下の項目のみを出力してください。
-
-■ 最新の世界観・組織の力学メモ（箇条書きでできるだけたくさん）：
-（※作中の社会構造と、組織・登場人物が「何をインセンティブ（利害）として動いているか」を超簡潔に更新）
-
-■ パワーバランスとキャラクター描写の検証ログ：
-・構造的合理性（組織・人物の動機の納得感、または文脈の保留）： （※社会構造や権力ライン、人物の立場から逆算して論理的に納得できる展開や政治劇のロジックを記述）
-・作為的無能・描写の歪みの指摘： （※「国家として当然行うべき声明発表や広報統制などの不自然な放置」や「個々のキャラがプロット都合で不自然に知性や警戒感を喪失している点」があれば冷酷に指摘。なければ「なし」と記述）`;
-    }
-
     return await callLLM({ systemContent, userContent, temperature: 0.0 });
 }
 
-// 最後にすべての記憶と指摘を統合して、カクヨム用の最終ログを作る関数
-async function generateFinalSummary(title, finalResult, isPartialRead = false) {
-    finalResult = truncateText(finalResult, MAX_CHARS_PER_REQUEST, '統合ログ（全セッション合計）', true);
+/**
+ * これまでの全検出ログを実際に検証・分析し、作為的無能の「傾向」を盛り込んだ最終監査報告書を生成する関数
+ */
+async function generateFinalSummary(title, auditHistory, currentRangeStr) {
+    const totalChunks = auditHistory.length;
+    
+    // 実際に「歪み・作為的無能」があると判定されたログのみを抽出
+    const detectedIssues = auditHistory.filter(h => h.hasIssue);
+    const issueCount = detectedIssues.length;
 
-    let systemContent = "";
-    let userContent = "";
+    // 抽出された実際の指摘テキスト（なければ「指摘なし」）
+    const issueLogsText = issueCount > 0
+        ? detectedIssues.map(h => `・[${h.rangeStr}] ${h.incompetencePoint}`).join('\n')
+        : '（実質的な作為的無能・作劇上の露骨な歪みは検出されませんでした）';
 
-    const finalSummaryPrinciples = `
-※重要：国家や組織の動きに政治的・構造的な理由付けが存在していることだけで満足せず、その枠組みの中で動く個々のキャラクターの行動・判断に「展開都合の作為的無能や知性の崩壊」がないかを厳格に総括してください。
-`;
+    const systemContent = `あなたは小説の「組織描写・政治劇・キャラクター行動の納得感」を総合的に分析・評価する知的な文学アナリストです。
+これまでの全エピソードの監査ログ（全${totalChunks}個の区間のうち、実際に不自然な歪みが指摘された区間：${issueCount}箇所）を念頭に置き、作品全体の「作為的無能や描写の歪みの有無およびその『傾向』」について包括的な判定報告書を作成してください。
 
-    if (isPartialRead) {
-        systemContent = `あなたは小説における「リアルな組織描写と政治劇、およびキャラクター行動の完成度」を審査する、極めて知的なWeb小説批評家です。単なるあらすじの要約は【絶対厳禁】です。マクロ（組織）とミクロ（人物描写）の両面から精緻な評価を行ってください。${finalSummaryPrinciples}`;
-        userContent = `以下の「各セッションの検証ログ」を統合し、カクヨムの応援コメント欄にそのままコピペできる形（300〜400文字程度）の、解像度の高い「構造監査報告書」を作成してください。
+【分析のガイドライン】
+1. 二元論的な合格/不合格ではなく、「どのような場面で作為的無能（プロット都合の知性低下・組織の放置など）が発生しやすいか、あるいは全体を通して整合性が保たれているか」という【傾向】を言語化してください。
+2. あらすじの単なる要約は【絶対禁止】です。
+3. 全体の文字数は300〜400文字程度に収めてください。`;
 
-【監査データ】
-${finalResult}
+    const userContent = `【作品タイトル】
+『${title}』 (監査範囲: ${currentRangeStr} まで)
 
-【出力のガイドライン】
-・組織の意思決定の妥当性（マクロ）と、個々のキャラクターの行動の説得力・リアリティ（ミクロ）の双方を分析してください。
-・国家・組織レベルの動きに理由があっても、キャラクターがイベント消化のために不自然に無能化・雑に描写されている点がないかを客観的に評価してください。
-・挨拶や前置き、余計な解説は一切省き、指定のフォーマットの項目のみを出力すること。
+【評価対象区間数】
+全 ${totalChunks} 区間（うち明らかな不自然さの指摘があった区間: ${issueCount} 箇所）
 
-【システム監査ログ：全話深層スクリーニング [APPROVE]】
-『${title}』の全編にわたる組織力学および登場人物の行動整合性の監査を完了しました。
+【検出された作為的無能・描写の歪みの実際の指摘一覧】
+${issueLogsText}
 
-■ 組織論理・キャラクター行動の納得感：
-（※社会構造に即した組織の動きと、個々の登場人物のインセンティブ・動機に基づく行動の説得力を記述。あらすじは厳禁）
+【出力フォーマット】
+以下の指定フォーマットのみを出力すること。
 
-■ 制度ハック・人物描写の歪み判定：
-（※構造のスキマを突いた知的なハックが機能しているか、あるいは「国家の理由付け」の裏で個々のキャラがプロット都合で都合よく知性や警戒を失わされていないかを判定。あらすじは厳禁）`;
-    } else {
-        systemContent = `あなたは小説における「リアルな組織描写と政治劇、およびキャラクター行動の完成度」を審査する、極めて知的なWeb小説批評家です。単なるあらすじの要約やお世辞は【絶対厳禁】です。組織の論理とキャラクターの行動における作為的な崩壊に対して冷徹に牙を剥いてください。${finalSummaryPrinciples}`;
-        userContent = `以下の「各セッションの検証ログ」を統合し、カクヨムの応援コメント欄にそのままコピペできる形（300〜400文字程度）の、解像度の高い「構造監査報告書」を作成してください。
-
-【監査データ】
-${finalResult}
-
-【出力のガイドライン】
-・国家や組織の動きに政治的・構造的な説明がついているか否かにかかわらず、登場人物個々の振る舞いに「プロット消化のための作為的な無能化・知性低下」がないかを厳しく検証・指摘してください。
-・挨拶や前置き、余計な解説は一切省き、指定のフォーマットの項目のみを出力すること。
-
-【システム監査ログ：全話深層スクリーニング [APPROVE]】
-『${title}』の全編にわたる組織力学および登場人物の行動整合性の監査を完了しました。
+【システム監査ログ：全話深層スクリーニング】
+『${title}』の全編（${currentRangeStr}まで）にわたる組織力学および登場人物の行動整合性の監査を完了しました。
 
 ■ 組織論理・キャラクター行動の納得感：
-（※社会構造に応じた組織・国家の動きと、個々の登場人物の立ち回りのリアリティを記述。あらすじは厳禁）
+（※世界観や社会構造に応じた組織の動きと、登場人物の動機に基づく立ち回りの説得力を記述。あらすじは厳禁）
 
-■ 制度ハック・人物描写の歪み判定：
-（※知的なハックや政治劇として成立しているか、あるいは「組織の背景」で誤魔化しつつキャラ個人が展開都合で不自然な失言・失策・無能化を起こしていないかを冷酷に指摘。あらすじは厳禁）`;
-    }
+■ 作為的無能・描写の歪みの傾向と判定：
+（※検出された指摘ログを踏まえ、「どのような展開・状況で作為的無能や不自然な描写が生じやすい傾向があるか」、または「終始一貫して高い整合性が維持されているか」という『傾向と特徴』を分析して記述。あらすじは厳禁）`;
 
-    return await callLLM({ systemContent, userContent, temperature: 0.3 });
+    return await callLLM({ systemContent, userContent, temperature: 0.2 });
 }
 
 async function main() {
     try {
         const targetDir = path.join(process.cwd(), INPUT_DIR_NAME);
-        
+
         // 自然数ソート
         const files = fs.readdirSync(targetDir)
             .filter(file => file.endsWith('.txt'))
             .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
-        
+
         let workTitle = '判定対象作品';
         let allEpisodes = [];
 
@@ -372,15 +317,15 @@ async function main() {
 
         console.log(`▶ 使用LLM: ${USE_CLAUDE ? `Claude API (${CLAUDE_MODEL_NAME})` : `Ollama (${OLLAMA_MODEL_NAME})`}`);
         console.log(`▶ 作品名: 『${workTitle}』 (全 ${allEpisodes.length} 話を読み込み完了)`);
-        console.log(`▶ 解析を開始します... (部分読みモード: ${isPartialRead ? "ON" : "OFF"})`);
+        console.log(`▶ 解析を開始します... (部分読みモード: ${isPartialRead ? "ON" : "OFF"})\n`);
 
         let currentMemory = "";
-        let allPoints = [];
+        let currentFinalSummary = "";
         let totalReadChars = 0;
+        const auditHistory = []; // 全区間の監査ログを蓄積する配列
 
         for (let i = 0; i < allEpisodes.length; i += CHUNK_SIZE) {
             const chunk = allEpisodes.slice(i, i + CHUNK_SIZE);
-            
             const chunkChars = chunk.reduce((sum, ep) => sum + ep.text.length, 0);
 
             if (totalReadChars + chunkChars > MAX_TOTAL_CHARS) {
@@ -392,50 +337,48 @@ async function main() {
 
             const startEp = chunk[0].name;
             const endEp = chunk[chunk.length - 1].name;
+            const rangeStr = (CHUNK_SIZE < 2) ? `[${startEp}]` : `[${startEp} 〜 ${endEp}]`;
 
-            if(CHUNK_SIZE < 2){
-                console.log(`\n┌───────────────────────────────┐`);
-                console.log(`│ 📌 [${startEp}] 終了時点の状況と作為的無能チェック`);
-                console.log(`└───────────────────────────────┘`);
-                console.log(`▶ 監査セッション [${startEp}] を実行中... (累計: ${totalReadChars.toLocaleString()} / ${MAX_TOTAL_CHARS.toLocaleString()} 字)`);
-            }else{
-                console.log(`\n┌───────────────────────────────┐`);
-                console.log(`│ 📌 [${startEp} 〜 ${endEp}] 終了時点の状況と作為的無能チェック`);
-                console.log(`└───────────────────────────────┘`);
-                console.log(`▶ 監査セッション [${startEp} 〜 ${endEp}] を実行中... (累計: ${totalReadChars.toLocaleString()} / ${MAX_TOTAL_CHARS.toLocaleString()} 字)`);        
-            }
-            
+            console.log(`┌───────────────────────────────┐`);
+            console.log(`│ 📌 ${rangeStr} 監査実行中 (累計: ${totalReadChars.toLocaleString()} / ${MAX_TOTAL_CHARS.toLocaleString()} 字)`);
+            console.log(`└───────────────────────────────┘`);
+
+            // 1. チャンク自体の個別監査
             const result = await auditChunk(workTitle, chunk, currentMemory, isPartialRead);
-            
+
             currentMemory = extractMemory(result, currentMemory); 
             const incompetencePoint = extractIncompetence(result);
+            const hasIssue = isIssueDetected(incompetencePoint);
 
-            console.log(`${currentMemory}\n`);
-            console.log(`⚠️ 【検出ログ】${incompetencePoint}\n`);
-            
-            allPoints.push(`--- [${startEp}-${endEp} の指摘] ---\n${result}`);
+            // 履歴に保持
+            auditHistory.push({
+                rangeStr: rangeStr,
+                incompetencePoint: incompetencePoint,
+                hasIssue: hasIssue
+            });
+
+            console.log(`\n【今回の文脈メモ】\n${currentMemory}\n`);
+            console.log(`⚠️ 【検出ログ】\n${incompetencePoint} (${hasIssue ? '※指摘あり' : '※指摘なし'})\n`);
+
+            // 2. 蓄積された実際の指摘ログに基づいて「歪みの傾向」を分析した統合レポートを作成
+            console.log(`▶ ${rangeStr} 時点の「統合・最終監査報告書」を更新中...`);
+            currentFinalSummary = await generateFinalSummary(workTitle, auditHistory, rangeStr);
+
+            console.log(`\n================ 生成された最終監査ログ ================`);
+            console.log(currentFinalSummary);
+            console.log(`\n====================================================\n`);
         }
 
-        if (allPoints.length === 0) {
-            console.log("\n[INFO] 対象テキストが存在しないか、最初の2話で文字数上限を超えたため出力をスキップします。");
+        if (!currentFinalSummary) {
+            console.log("\n[INFO] 対象テキストが存在しないか、最初の話数で文字数上限を超えたため出力をスキップします。");
             return;
         }
 
-        console.log(`\n▶ 全話の監査が完了しました（最終読み込み: ${totalReadChars.toLocaleString()}字）。`);
+        console.log(`▶ 全話の監査および最終統合処理が完了しました（最終読み込み: ${totalReadChars.toLocaleString()}字）。`);
+        console.log(`\n================ 最終確定 監査ログ ================`);
+        console.log(currentFinalSummary);
+        console.log(`==================================================\n`);
 
-        let fullLogText = allPoints.join('\n\n');
-
-        if (fullLogText.length > LOG_SUMMARY_THRESHOLD) {
-            fullLogText = await summarizeAllLogs(fullLogText);
-        }
-
-        console.log(`▶ カクヨム用フォーマットに最終統合中...`);
-        const finalSummary = await generateFinalSummary(workTitle, fullLogText, isPartialRead);
-
-        console.log(`\n================ 生成された最終監査ログ ================`);
-        console.log(finalSummary);
-        console.log(`\n====================================================\n`);
-        
     } catch (err) {
         console.error("\n[ERROR] 致命的なエラーが発生しました:", err.message);
     }
