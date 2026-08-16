@@ -4,7 +4,7 @@ import os from 'os';
 import fs from 'fs';
 
 // --- 設定情報 ---
-const TARGET_WORK_ID = '2912051598373835505'; 
+const TARGET_WORK_ID = '2912051603107883578'; 
 const OUTPUT_DIR_NAME = 'kakuyomu_episodes';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -74,12 +74,25 @@ async function fetchAndSaveEpisodes(page, workId) {
     await page.waitForSelector('#workTitle, [class*="title"]', { timeout: 10000 }).catch(() => null);
     
     // 1. 作品名の取得とクレンジング
-    let title = await page.$eval('#workTitle, [class*="title"]', el => el.innerText)
-        .catch(async () => {
-            return await page.$eval('title', el => el.innerText).catch(() => '対象作品');
-        });
+    //let title = await page.$eval('#workTitle, [class*="title"]', el => el.innerText)
+    //    .catch(async () => {
+    //        return await page.$eval('title', el => el.innerText).catch(() => '対象作品');
+    //    });
+    //title = title.trim();
+    //const titleClean = title.replace(/[\\/:*?"<>|]/g, '_');
+
+    // 1. 作品名の取得とクレンジング（パンくずリストからピンポイントで取得）
+    let title = await page.$eval(
+        '#worksEpisodesEpisodeHeader-breadcrumbs [itemprop="itemListElement"]:first-child [itemprop="name"]', 
+        el => el.innerText
+    ).catch(async () => {
+        // 万が一パンくずが見つからない場合のフォールバック（旧処理）
+        return await page.$eval('#workTitle, [class*="title"], title', el => el.innerText).catch(() => '対象作品');
+    });
+
     title = title.trim();
     const titleClean = title.replace(/[\\/:*?"<>|]/g, '_');
+
 
     // 2. 保存用ディレクトリの準備
     const outputDir = path.join(process.cwd(), OUTPUT_DIR_NAME);
