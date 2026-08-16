@@ -1,0 +1,131 @@
+システム仕様書：Web小説構造・描写監査スクリプト (Automated Novel Auditor)
+1. システム概要
+本システムは、カクヨムなどのWeb小説テキスト（エピソード単位のファイル群）を読み込み、LLM（Claude API または ローカルOllama）を用いて「組織力学・政治劇の合理性」および「作劇上の都合によるキャラクターの作為的無能化・知性低下」を自動的に検証・監査するプログラムである。
+
+各エピソード単位で監査・文脈メモリの更新を行い、最終的に全セッションのログを統合・整理してカクヨム投稿用の「構造監査報告書」を生成する。
+
+2. 動作環境・依存関係
+実行環境: Node.js (ES Modules または CommonJS / fetch APIをサポートするバージョン)
+
+モジュール: fs, path（Node.js 標準モジュール）
+
+連携外部API / サービス:
+
+Ollama (ローカルLLM): http://localhost:11434/api/chat
+
+Anthropic Claude API: [https://api.anthropic.com/v1/messages](https://api.anthropic.com/v1/messages)
+
+3. 設定パラメータ（定数一覧）
+定数名,型,設定値,説明
+USE_CLAUDE,Boolean,false,true: Claude API を使用 / false: Ollama を使用
+OLLAMA_API_URL,String,'http://localhost:11434/api/chat'Ollama のチャットエンドポイントOLLAMA_MODEL_NAMEString'qwen-64k'Ollama で使用するモデル名CLAUDE_API_URL,String,'[https://api.anthropic.com/v1/messages](https://api.anthropic.com/v1/messages)',Claude API のエンドポイントCLAUDE_MODEL_NAMEString'claude-3-5-sonnet-20241022'使用する Claude モデル名
+ANTHROPIC_API_KEY,String,process.env.ANTHROPIC_API_KEY,Claude APIキー（環境変数を優先）
+INPUT_DIR_NAME,String,'kakuyomu_episodes',入力テキストファイルが置かれたディレクトリ名
+MAX_CHARS_PER_REQUEST,Number,15000,LLMリクエスト時の1回あたり上限文字数（切り詰めの閾値）
+LOG_SUMMARY_THRESHOLD,Number,12000,累積ログの中間要約を発動させる文字数閾値
+MAX_TOTAL_CHARS,Number,500000,全体で読み込む累計テキストの上限文字数
+CHUNK_SIZE,Number,1,1回の監査セッションで処理するエピソード数
+NUM_CTX,Number,16384,Ollama 呼び出し時のコンテキストウィンドウサイズ
+
+
+4. 機能仕様および処理フロー
+4.1 コマンドライン引数
+--partial: 部分読みモードを有効化。後続の伏線や未登場設定の存在を考慮した監査プロンプトに切り替わる。
+
+4.2 主要処理フロー (main 関数)
+Plaintext
+[1. ファイル読み込み & 前処理]
+   │  `kakuyomu_episodes` 内の `.txt` ファイルを自然数ソートで取得。
+   │  各ファイルから「作品名」「エピソード名」「本文（ヘッダー除外）」を抽出。
+   ▼
+[2. エピソード単位のループ処理 (auditChunk)]
+   │  CHUNK_SIZE (1話) 毎に本文を取得し、文字数上限 (MAX_TOTAL_CHARS) をチェック。
+   │  `auditChunk` を呼び出し、LLMに監査を行わせる。
+   │  ・最新の世界観・組織メモ (`currentMemory`) を更新。
+   │  ・作為的無能の検出ログを抽出・コンソール表示。
+   ▼
+[3. ログの肥大化チェック & 中間要約 (summarizeAllLogs)]
+   │  全話終了後、累積ログ文字数が `LOG_SUMMARY_THRESHOLD` (12,000字) を超えている場合、
+   │  ログをチャンク分割してLLMで個別要約し、圧縮・結合する。
+   ▼
+[4. 最終統合ログ生成 (generateFinalSummary)]
+   │  整理された監査ログを元に、カクヨム応援コメント用の「構造監査報告書」を生成。
+   ▼
+[5. 結果出力]
+   │  コンソールに最終監査ログを出力して終了。
+5. モジュール・関数仕様
+5.1 callLLM({ systemContent, userContent, temperature })
+LLMに対する共通APIインターフェース。USE_CLAUDE の値に応じて呼び出し先を動的に切り替える。
+
+タイムアウト機能: 10分（600,000ms）で AbortController によるリクエスト中断を行う。
+
+Claude API 呼び出し:
+
+APIキーチェックを行い、x-api-key ヘッダーを付与して POST。
+
+max_tokens: 4000 でレスポンスを取得。
+
+Ollama 呼び出し:
+
+OLLAMA_API_URL に options.num_ctx 等のパラメータを含めて POST。
+
+5.2 truncateText(text, maxChars, label, keepEnd)
+テキストが指定文字数 (maxChars) を超えた場合に切り詰めるユーティリティ関数。
+
+keepEnd = true: 前半を省略し、後半（最新の文脈）を残す。
+
+keepEnd = false: 後半を省略し、前半を残す。
+
+5.3 extractMemory(responseText, previousMemory)
+LLMの返答テキストから正規表現で ■ 最新の世界観・組織の力学メモ セクションを切り出す。
+
+抽出失敗時は前回のメモ (previousMemory) を維持するフォールバック処理を持つ。
+
+5.4 extractIncompetence(responseText)
+LLMの返答テキストから正規表現で 作為的無能・描写の歪みの指摘 部分を抽出する。
+
+5.5 summarizeAllLogs(fullLog)
+肥大化した過去ログ (fullLog) を LOG_SUMMARY_THRESHOLD 単位で分割（chunkText）し、LLMに各ブロックを1,000字程度へ要約させる。要約されたブロック群を結合して返す。
+
+5.6 auditChunk(title, episodes, currentMemory, isPartialRead)
+各エピソード（チャンク）を監査するコア関数。
+
+システムプロンプトの最重要原則:
+
+マクロ視点: 国家・組織として当然取るべき初期対応（公式声明、危機管理ライン等）の不自然な放置（＝組織レベルの作為的無能）を厳しく監査。
+
+ミクロ視点: プロット進行や特定キャラの引き立てのために、キャラが不自然な失言・判断ミス・警戒感の欠落（＝個人レベルの作為的無能）を起こしていないかを判定。
+
+通常モードと部分読みモード (isPartialRead) でプロンプトを微調整する。
+
+5.7 generateFinalSummary(title, finalResult, isPartialRead)
+全セッションの検証結果を結合したデータ (finalResult) を基に、300〜400文字程度の「構造監査報告書」形式に要約・整形する。単なるあらすじ要約を厳禁とし、組織論理と人物描写の歪みに対する冷徹な批評を出力させる。
+
+6. 入力ファイルフォーマット仕様
+入力ディレクトリ (kakuyomu_episodes) 内の各 .txt ファイルは以下の形式を想定している。
+
+Plaintext
+作品名：〇〇〇〇
+エピソード：第1話 〇〇〇〇
+────────────────────────────────────
+（本文テキスト）
+作品名： 行から作品タイトルを取得（最初のファイルで判別）。
+
+エピソード： 行から各話タイトルを取得。
+
+────── (ハイフン20個以上) の区切り線以降をエピソード本文として抽出。
+
+区切り線がない場合は、ファイル名（拡張子除く）をエピソード名とし、全文を本文として扱う。
+
+7. 例外処理・エラーハンドリング
+APIタイムアウトエラー:
+LLMからの応答が10分を超えた場合、AbortError をキャッチして「応答がタイムアウトしました」とのメッセージを出力。
+
+APIステータスエラー:
+Claude/Ollama から HTTP 200 以外が返された場合、ステータスコードとエラーメッセージを出力して処理を停止。
+
+抽出失敗時のフォールバック:
+LLMが出力フォーマットに違反してメモが抽出できなかった場合、警告ログを出力しつつ前回の記憶を維持して処理を続行。
+
+対象ファイル不在 / 文字数超過による即時終了:
+解析対象が存在しない場合、エラーを回避してログを出力し安全に終了する。
