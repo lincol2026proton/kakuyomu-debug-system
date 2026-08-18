@@ -4,7 +4,7 @@ import os from 'os';
 import fs from 'fs';
 
 // --- 設定情報 ---
-const TARGET_WORK_ID = '2912051603107883578'; 
+const TARGET_WORK_ID = '822139846598067555'; 
 const OUTPUT_DIR_NAME = 'kakuyomu_episodes';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
