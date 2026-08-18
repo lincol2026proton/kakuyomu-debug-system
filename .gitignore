@@ -13,7 +13,8 @@
 # 3. 指定フォルダ自体のトラックを許可
 !log/
 !kakuyomu_episodes/
-!result
+!result/
+!result/**
 
 # 4. フォルダ内の .gitkeep のみ許可（中身のファイルはすべて除外される）
 !.gitkeep
