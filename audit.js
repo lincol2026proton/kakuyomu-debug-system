@@ -18,7 +18,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 // 共通設定
 const INPUT_DIR_NAME = 'kakuyomu_episodes';
 const MAX_CHARS_PER_REQUEST = 15000;
-const MAX_TOTAL_CHARS = 1200000;
+const MAX_TOTAL_CHARS = 600000;
 
 const CHUNK_SIZE = 1;
 const NUM_CTX = 16384; 
@@ -81,12 +81,14 @@ function isIssueDetected(incompetenceText) {
         '問題なし', '整合性が保たれている', '不自然な点は見られない', '顕著な歪みはない'
     ];
 
+    // 本文が非常に短く、かつ「なし」系キーワードに該当する場合は問題なしと判定
     for (const keyword of noIssueKeywords) {
         if (bodyText === keyword || bodyText.startsWith(keyword + '。') || bodyText.startsWith(keyword + '（') || bodyText.startsWith(keyword + '\n')) {
             return false;
         }
     }
 
+    // 「なし」などのキーワードのみで構成されているか判定
     const cleaned = bodyText.replace(/[。、\n\s（）()]/g, '');
     if (noIssueKeywords.some(k => cleaned === k)) {
         return false;
@@ -229,44 +231,6 @@ ${episodeListStr}
 }
 
 /**
- * 過去の指摘リストと今回の指摘を比較し、重複のない「新しい指摘（差分）」のみを抽出する
- */
-async function extractNewIssuesOnly(existingIssuesText, currentIncompetencePoint, rangeStr) {
-    if (!existingIssuesText) {
-        return `・[${rangeStr}] ${currentIncompetencePoint}`;
-    }
-
-    const systemContent = `あなたは小説の描写分析ログを整理するデータアナリストです。
-「これまでの指摘リスト」と「今回新たに提出された指摘」を比較・分析してください。
-
-【タスク】
-1. 「今回新たに提出された指摘」の中に、「これまでの指摘リスト」と【実質的に同内容・同パターンの問題（表記揺れ含む）】があれば、それは重複とみなして除外してください。
-2. 過去の指摘にはなかった【明確に新しい展開・新しいキャラクター・新しい種類の不自然さ】が含まれている場合のみ、その差分（新しい指摘）だけを簡潔に抽出してください。
-3. 新しい指摘がない場合や全て重複の場合は「なし」とだけ出力してください。`;
-
-    const userContent = `【これまでの指摘リスト】
-${existingIssuesText}
-
-【今回新たに提出された指摘 (${rangeStr})】
-${currentIncompetencePoint}
-
-【出力フォーマット】
-重複のない新しい指摘がある場合：
-・[${rangeStr}] （新しく判明した問題点の要約）
-
-重複・新指摘なしの場合：
-なし`;
-
-    const result = await callLLM({ systemContent, userContent, temperature: 0.1 });
-    const cleanResult = result.trim();
-
-    if (cleanResult.includes('なし') || cleanResult === '' || cleanResult.includes('重複')) {
-        return null;
-    }
-    return cleanResult;
-}
-
-/**
  * これまでの全検出ログを実際に検証・分析し、作為的無能の「傾向」を盛り込んだ最終監査報告書を生成する関数
  */
 async function generateFinalSummary(title, auditHistory, currentRangeStr) {
@@ -276,8 +240,9 @@ async function generateFinalSummary(title, auditHistory, currentRangeStr) {
     const detectedIssues = auditHistory.filter(h => h.hasIssue);
     const issueCount = detectedIssues.length;
 
+    // 抽出された実際の指摘テキスト（なければ「指摘なし」）
     const issueLogsText = issueCount > 0
-        ? detectedIssues.map(h => h.issueText).join('\n')
+        ? detectedIssues.map(h => `・[${h.rangeStr}] ${h.incompetencePoint}`).join('\n')
         : '（実質的な作為的無能・作劇上の露骨な歪みは検出されませんでした）';
 
     const systemContent = `あなたは小説の「組織描写・政治劇・キャラクター行動の納得感」を総合的に分析・評価する知的な文学アナリストです。
@@ -316,6 +281,7 @@ async function main() {
     try {
         const targetDir = path.join(process.cwd(), INPUT_DIR_NAME);
 
+        // 自然数ソート
         const files = fs.readdirSync(targetDir)
             .filter(file => file.endsWith('.txt'))
             .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
@@ -356,7 +322,7 @@ async function main() {
         let currentMemory = "";
         let currentFinalSummary = "";
         let totalReadChars = 0;
-        const auditHistory = []; 
+        const auditHistory = []; // 全区間の監査ログを蓄積する配列
 
         for (let i = 0; i < allEpisodes.length; i += CHUNK_SIZE) {
             const chunk = allEpisodes.slice(i, i + CHUNK_SIZE);
@@ -381,51 +347,27 @@ async function main() {
             const result = await auditChunk(workTitle, chunk, currentMemory, isPartialRead);
 
             currentMemory = extractMemory(result, currentMemory); 
-            const rawIncompetence = extractIncompetence(result);
-            const issueDetected = isIssueDetected(rawIncompetence);
+            const incompetencePoint = extractIncompetence(result);
+            const hasIssue = isIssueDetected(incompetencePoint);
 
-            let diffIssue = null;
-            let hasIssue = false;
-
-            // 2. 問題が検知された場合のみ、過去の指摘と比較して差分（新しい指摘）を抽出
-            if (issueDetected) {
-                const existingIssuesText = auditHistory
-                    .filter(h => h.hasIssue)
-                    .map(h => h.issueText)
-                    .join('\n');
-
-                diffIssue = await extractNewIssuesOnly(existingIssuesText, rawIncompetence, rangeStr);
-                hasIssue = Boolean(diffIssue);
-            }
+            // 履歴に保持
+            auditHistory.push({
+                rangeStr: rangeStr,
+                incompetencePoint: incompetencePoint,
+                hasIssue: hasIssue
+            });
 
             console.log(`\n【今回の文脈メモ】\n${currentMemory}\n`);
+            console.log(`⚠️ 【検出ログ】\n${incompetencePoint} (${hasIssue ? '※指摘あり' : '※指摘なし'})\n`);
 
-            if (hasIssue) {
-                console.log(`✨【新しい種類の指摘を検出】(※指摘あり)\n${diffIssue}\n`);
-                auditHistory.push({
-                    rangeStr: rangeStr,
-                    issueText: diffIssue,
-                    incompetencePoint: diffIssue,
-                    hasIssue: true
-                });
-            } else {
-                console.log(`ℹ️ 【指摘ログ更新なし】(※問題なし、または既出パターンと同内容のためスキップ)\n`);
-                auditHistory.push({
-                    rangeStr: rangeStr,
-                    issueText: null,
-                    incompetencePoint: null,
-                    hasIssue: false
-                });
-            }
-
-            // 3. 統合監査報告書の更新
+            // 2. 蓄積された実際の指摘ログに基づいて「歪みの傾向」を分析した統合レポートを作成
             console.log(`▶ ${rangeStr} 時点の「統合・最終監査報告書」を更新中...`);
             currentFinalSummary = await generateFinalSummary(workTitle, auditHistory, rangeStr);
 
             console.log(`\n================ 生成された最終監査ログ ================`);
             console.log(currentFinalSummary);
             console.log(`\n====================================================\n`);
-        }        
+        }
 
         if (!currentFinalSummary) {
             console.log("\n[INFO] 対象テキストが存在しないか、最初の話数で文字数上限を超えたため出力をスキップします。");
