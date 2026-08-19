@@ -4,6 +4,7 @@
 # 2. 直下の指定ファイルのみ許可
 !.gitignore
 !audit.js
+!audit-dev.js
 !index.js
 !package.json
 !package-lock.json
